@@ -1,0 +1,302 @@
+# =====================================================================
+# 05 - FLAT-BENEFIT VALUATION: BEL_0, 99.5% STRESSED TABLE, CAPITAL
+#
+#   One cohort per (sex, attained age at t0), each life carrying a flat
+#   benefit of one euro on death.  Only cohorts aged BOOK_AGE_LO or more
+#   are kept: below 60 the extract holds about 1% of the lives.
+#   Amounts are dropped, since what is compared across model variants is the mortality, but the run-off is
+#   kept.
+#
+#   THE RUN-OFF IS IMPOSED.  The extract carries no remaining term, so
+#   the book is assumed to have been written at a constant rate on
+#   TERM_YEARS contracts.  Remaining terms are then uniform over
+#   1..TERM_YEARS, the share still covered in year k is (term - k)/term,
+#   and the cohort empties linearly rather than all at once.  Cover
+#   ceases at MAX_AGE, so older cohorts run off sooner than the term
+#   alone implies.  Two forces reduce a cohort, expiry through those
+#   counts and death through the survival factor, and they apply
+#   together.  The level of BEL_0 is therefore indicative; the ratios
+#   between the variants are the quantity of interest.
+#
+#   Stage 3's own machinery is reused rather than reimplemented: its
+#   source is executed up to the RUN marker, which defines build_bundles,
+#   simulate and path_q without running its backtest or its projection.
+#   Paths start at the filtered state of end-2023, and one scenario set
+#   drives every age, so a path is a coherent scenario for the whole book.
+#   Every variant uses the same seed, so they differ in the model only.
+#
+#   Three quantities per variant, from the path-wise value L^(j) of the
+#   whole book (all cohorts, both sexes, on the same path j):
+#
+#     BEL     mean of L^(j) over the paths
+#     VaR     the ceil(0.995 N)-th ordered L^(j), an order statistic
+#             and not the mean of the worst 0.5%
+#     capital VaR - BEL
+#
+#   Male, Female and Total each take their own order statistic from the
+#   same paths, so the Total VaR is not the sum of the two.
+#
+#   The baseline is the full model on the portfolio intensity mu_2.
+#   Each variant takes one ingredient away:
+#
+#     no drift      m_x(t) frozen at its value at the projection origin,
+#                   so there is no improvement and only the mean-
+#                   reverting deviation moves
+#     no LRD        the H = 1/2 tables
+#     national      valued on mu_1, the national intensity, instead of
+#                   the portfolio's mu_2
+# =====================================================================
+import os
+import sys
+import time
+import numpy as np
+import pandas as pd
+
+ROOT       = r"C:\Users\sever\Documents\Tu Delft\Thesis\Italy_mortality"
+SCRIPT_DIR = os.path.join(ROOT, "scripts_local")
+OUT_DIR    = os.path.join(ROOT, "outputs")
+DATA_DIR   = os.path.join(ROOT, "data")
+S03        = os.path.join(SCRIPT_DIR, "stage03_projection.py")
+
+COUNTRY   = "IT"
+PROJ_END  = 2023                       # training end the tables carry
+PORT_FILE = os.path.join(DATA_DIR, "portfolio_exposure_CQP_2Q26.csv")
+PORT_YEAR = 2025                       # in-force counts read from this year
+
+BOOK_AGE_LO = 60                       # cohorts younger at t0 are dropped
+TERM_YEARS = 15                        # contract term at inception
+MAX_AGE    = 90                        # cover ceases at this age
+
+VAL_DATE  = (2026, 6, 6)               # t0
+RATE      = 0.005                      # flat discount rate
+BENEFIT   = 1.0                        # euro per death
+
+N_PATHS   = 30000
+MC_KSUB   = 48                         # substeps per year, dt = 1/48
+Q_HI      = 0.995                      # VaR level
+Q_LO      = 0.005                      # lower band, saved with the upper
+AGE_LO, AGE_HI = 30, 105               # fitted age range of the tables
+
+SEXES = ["Male", "Female"]
+VAL_T = VAL_DATE[0] + (VAL_DATE[1] - 1) / 12.0 + (VAL_DATE[2] - 1) / 365.25
+
+# name, parameter tables, intensity valued, trend frozen at the origin
+VARIANTS = [
+    dict(name="baseline", tables="lrd",   basis="portfolio", freeze=False),
+    dict(name="no drift", tables="lrd",   basis="portfolio", freeze=True),
+    dict(name="no LRD",   tables="nolrd", basis="portfolio", freeze=False),
+    dict(name="national", tables="lrd",   basis="national",  freeze=False),
+]
+
+
+def load_stage03(no_lrd):
+    """Execute stage 3 down to its RUN marker, returning its namespace.
+
+    Only the definitions are wanted: the backtest and the projection in
+    its run block would cost hours and are irrelevant here.  Numba's disk
+    cache is switched off, since exec'd code has no importable module and
+    a cached entry cannot be reloaded.
+    """
+    src = open(S03, encoding="utf-8").read()
+    head = src.split("# ================================ RUN")[0]
+    head = head.replace("cache=True", "cache=False")
+    argv = ["stage03", "-c", COUNTRY, "-e", str(PROJ_END)]
+    if no_lrd:
+        argv.append("--no-lrd")
+    keep, sys.argv = sys.argv, argv
+    ns = {"__name__": "stage03_defs"}
+    exec(compile(head, S03, "exec"), ns)
+    sys.argv = keep
+    return ns
+
+
+def load_book(path, year, age_lo=AGE_LO):
+    """Lives in force per (sex, age at t0) and projected year.
+
+    Steady state: remaining terms uniform over 1..term, so the share of
+    a cohort still covered in year k is (term - k)/term, with
+    term = min(TERM_YEARS, MAX_AGE - age).  Cohorts below age_lo or
+    already at MAX_AGE are dropped.
+    """
+    df = pd.read_csv(path)
+    df = df[(df.year == year) & (df.age >= age_lo) & (df.age < MAX_AGE)
+            & (df.policies > 0)]
+
+    book = {}
+    for r in df.itertuples(index=False):
+        term = min(TERM_YEARS, MAX_AGE - int(r.age))
+        cnt  = np.zeros(TERM_YEARS)
+        cnt[:term] = float(r.policies) * (term - np.arange(term)) / term
+        book[(r.sex, int(r.age))] = cnt
+    return book, TERM_YEARS
+
+
+def freeze_trend(B, year):
+    """Bundle with m_x held at its value in `year`, so no improvement.
+
+    The trend is exp(a + b (t - T0)); moving b (year - T0) into a and
+    setting b = 0 keeps m_x(year) and drops the drift.  The state, and
+    with it the deviation, is untouched.
+    """
+    B = dict(B)
+    B["a"] = B["a"] + B["b"] * (float(year) - B["T0"])
+    B["b"] = 0.0
+    return B
+
+
+def cover_years(cnt):
+    """Run-off years in which a cohort still has lives covered."""
+    return int(np.count_nonzero(cnt))
+
+
+def needed_cells(book, age_hi=AGE_HI):
+    """Run-off years needed per (sex, attained age), over all cohorts.
+
+    A cohort aged a at t0 reads age a + n in run-off year n while it is
+    still covered, so age x is needed up to year max(x - a) + 1 over the
+    cohorts that reach it.  Ages no cohort reaches are not simulated.
+    """
+    need = {}
+    for (sex, age), cnt in book.items():
+        for n in range(cover_years(cnt)):
+            k = (sex, min(age + n, age_hi))
+            need[k] = max(need.get(k, 0), n + 1)
+    return need
+
+
+def value(book, qmat, disc, horizon, age_hi=AGE_HI):
+    """Discounted expected benefits, vectorised over the leading axis.
+
+    Survival compounds within each cohort while its count declines with
+    expiry, so a path index carries through and the same routine values
+    one deterministic table or a whole set of simulated paths.  The
+    cohort stops at its last covered year, the only years simulated.
+    """
+    total = 0.0
+    for (sex, age), cnt in book.items():
+        surv = 1.0
+        for n in range(cover_years(cnt)):
+            q = qmat[(sex, min(age + n, age_hi))][..., n]
+            total = total + BENEFIT * cnt[n] * disc[n] * surv * q
+            surv = surv * (1.0 - q)
+    return total
+
+
+# ================================ RUN ================================
+book, HORIZON = load_book(PORT_FILE, PORT_YEAR, age_lo=BOOK_AGE_LO)
+NEED = needed_cells(book)
+print(f"{len(book)} cohorts, {sum(w[0] for w in book.values()):,.0f} lives "
+      f"at t0, ages {min(a for _, a in book)}-{max(a for _, a in book)}, "
+      f"horizon {HORIZON} years", flush=True)
+print("  lives in force by year: " + "  ".join(
+    f"{n}:{sum(w[n] for w in book.values()):,.0f}"
+    for n in range(HORIZON)), flush=True)
+print("  simulated: " + "  ".join(
+    f"{s} ages {min(a for t, a in NEED if t == s)}-"
+    f"{max(a for t, a in NEED if t == s)}" for s in SEXES)
+    + f", {len(NEED)} cells, {sum(NEED.values())} cell-years", flush=True)
+
+disc = np.array([(1.0 + RATE) ** -(n + 0.5) for n in range(HORIZON)])
+
+# each sex valued on its own, and the book as a whole, all from the
+# same paths; each group takes its own order statistic, so neither the
+# VaR nor the sd of the book is the sum of the sexes
+GROUPS = SEXES + ["Total"]
+books  = {g: ({k: v for k, v in book.items() if k[0] == g}
+              if g != "Total" else book) for g in GROUPS}
+
+# simulate from end-2023; year k covers [2023 + k, 2024 + k), so the
+# run-off starts in the year containing t0
+n_skip = int(np.floor(VAL_T - PROJ_END))
+
+# variants sharing tables and trend share one simulation: the baseline
+# and the national variant come off the same paths, p2 and p1
+runs = {}
+for v in VARIANTS:
+    runs.setdefault((v["tables"], v["freeze"]), []).append(v)
+
+# per variant, age and run-off year: mean q and its Q_LO / Q_HI bands
+# across paths; year is the calendar year the run-off year starts in
+res, BANDS = {}, []
+for (tables, freeze), vs in runs.items():
+    label = f"{tables}{', trend frozen' if freeze else ''}"
+    ns  = load_stage03(tables == "nolrd")
+    t0  = time.time()
+
+    bnds = {sex: ns["build_bundles"](COUNTRY, sex, PROJ_END) for sex in SEXES}
+
+    # each cell only as far as a covered cohort reads it; the paths are
+    # the same as a full-length run over those years, since the draws
+    # come in year order from a fresh seed per cell
+    bases  = {v["basis"] for v in vs}
+    qpaths = {b: {} for b in bases}
+    for sex in SEXES:
+        for (s, age), m in sorted(NEED.items()):
+            if s != sex:
+                continue
+            B = bnds[sex][age]
+            if freeze:
+                B = freeze_trend(B, PROJ_END)
+            p1, p2 = ns["simulate"](B, n_skip + m, n_paths=N_PATHS,
+                                    ksub=MC_KSUB)
+            for b, p in (("national", p1), ("portfolio", p2)):
+                if b in bases:
+                    qpaths[b][(sex, age)] = \
+                        ns["path_q"](p)[:, n_skip:].astype(np.float32)
+        print(f"  {label} {sex}: {time.time() - t0:.0f}s", flush=True)
+
+    for v in vs:
+        qp   = qpaths[v["basis"]]
+        q_hi = {k: np.quantile(x, Q_HI, axis=0) for k, x in qp.items()}
+        q_lo = {k: np.quantile(x, Q_LO, axis=0) for k, x in qp.items()}
+        for (sex, age), x in qp.items():
+            mean = x.mean(axis=0)
+            for n in range(x.shape[1]):
+                BANDS.append(dict(variant=v["name"], sex=sex, age=age,
+                                  n=n, year=PROJ_END + n_skip + n,
+                                  q_mean=float(mean[n]),
+                                  q_lo=float(q_lo[(sex, age)][n]),
+                                  q_hi=float(q_hi[(sex, age)][n])))
+        k_var = int(np.ceil(Q_HI * N_PATHS))       # 29,850th of 30,000
+        for grp, sub in books.items():
+            bel_paths = value(sub, qp, disc, HORIZON)
+            r = dict(bel=float(bel_paths.mean()),
+                     sd=float(bel_paths.std(ddof=1)),
+                     var=float(np.sort(bel_paths)[k_var - 1]))
+            r["capital"] = r["var"] - r["bel"]
+            res[(v["name"], grp)] = r
+    del qpaths
+    print(f"  {label} done in {time.time() - t0:.0f}s", flush=True)
+
+
+# ============================== RESULTS ==============================
+NAMES = [v["name"] for v in VARIANTS]
+hdr = f"{'sex':<8}{'variant':<11}{'BEL':>14}{'sd':>12}" \
+      f"{f'VaR {Q_HI:.1%}':>14}{'capital':>14}{'capital/BEL':>13}"
+for grp in GROUPS:
+    print("\n" + hdr)
+    for name in NAMES:
+        r = res[(name, grp)]
+        print(f"{grp:<8}{name:<11}{r['bel']:>14,.2f}{r['sd']:>12,.2f}"
+              f"{r['var']:>14,.2f}{r['capital']:>14,.2f}"
+              f"{r['capital'] / r['bel']:>13.2%}")
+
+for grp in GROUPS:
+    base = res[("baseline", grp)]
+    print(f"\n[{grp}] against the baseline")
+    print(f"  {'variant':<11}{'BEL':>10}{'VaR':>10}{'capital':>10}")
+    for name in NAMES[1:]:
+        r = res[(name, grp)]
+        print(f"  {name:<11}"
+              + "".join(f"{r[k] / base[k] - 1.0:>+10.2%}"
+                        for k in ("bel", "var", "capital")))
+
+pd.DataFrame([dict(variant=n, sex=g, **res[(n, g)])
+              for n in NAMES for g in GROUPS]
+             ).to_csv(os.path.join(
+                 OUT_DIR, f"flat_bel_{COUNTRY}_{PROJ_END}.csv"), index=False)
+
+pd.DataFrame(BANDS).rename(columns={
+    "q_lo": f"q_{Q_LO:.3f}", "q_hi": f"q_{Q_HI:.3f}"}
+    ).to_csv(os.path.join(
+        OUT_DIR, f"flat_bel_qx_bands_{COUNTRY}_{PROJ_END}.csv"), index=False)
